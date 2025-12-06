@@ -227,7 +227,7 @@ class Installer(Gtk.Window):
 
     def is_dark_theme(self):
         # Create a temporary widget (not shown)
-        templabel = Gtk.Label()
+        templabel = Gtk.Button()
         style_context = templabel.get_style_context()
         bg_color = style_context.get_background_color(Gtk.StateFlags.NORMAL)
         r, g, b = bg_color.red, bg_color.green, bg_color.blue
