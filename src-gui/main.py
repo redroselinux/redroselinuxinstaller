@@ -1,5 +1,7 @@
 import subprocess
+import threading
 import os
+import time
 import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, GdkPixbuf
@@ -153,10 +155,26 @@ class Installer(Gtk.Window):
             self.summary_box.pack_start(summary_row("system-users", f"Username: {self.username} | Password: {'*' * len(self.user_password)}"), False, False, 0)
             self.summary_box.pack_start(summary_row("preferences-desktop-user-password", f"Root Password: {'*' * len(self.root_password)}"), False, False, 0)
             self.summary_box.pack_start(summary_row("drive-harddisk", f"Target Drive: {self.target_drive}"), False, False, 0)
+            self.summary_box.pack_start(summary_row("applications-system", "UEFI Bitness: 64-bit" if self.uefi_bitness() == 64 else "UEFI Bitness: 32-bit"), False, False, 0)
 
             self.main_box.pack_start(self.summary_box, False, False, 0)
             self.main_box.reorder_child(self.summary_box, 3)
             self.main_box.show_all()
+        elif self.step == 9:
+            self.main_title.set_markup("<span size='xx-large' weight='bold'>Are you sure?</span>")
+            self.description.set_text(
+                "Close the window if you want to cancel the process."
+            )
+            self.button.set_label("Install")
+        elif self.step == 10:
+            self.button.set_label("Finish")
+            self.button.set_sensitive(False)
+            self.main_title.set_markup("<span size='xx-large' weight='bold'>Installation in progress</span>")
+            self.description.set_text(f"Installing to drive {self.target_drive}")
+            threading.Thread(target=self.wipe_drive, args=(self,), daemon=True).start()
+            threading.Thread(target=self.setup_drive, args=(self,), daemon=True).start()
+            threading.Thread(target=self.install_base_system, args=(self,), daemon=True).start()
+
         else:
             self.main_title.set_markup("<span size='xx-large' weight='bold'>Installation was finished.</span>")
             self.description.set_text(
@@ -234,6 +252,96 @@ class Installer(Gtk.Window):
         luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
         del templabel # Because 1 byte of memory is too much to waste :D
         return luminance < 0.5
+    
+    def wipe_drive(self, widget):
+        if not debug:
+            print("WIPING DRIVE!")
+            try:
+                os.system("sgdisk -Z '{self.target_drive.split()[0]}'".format(self=self))
+            except Exception:
+                os.system("sgdisk -Z '/dev/{self.target_drive.split()[0]}'".format(self=self))
+        elif debug:
+            print("DEBUG MODE: Skipping drive wipe.")
+            time.sleep(2)
+    
+    def uefi_bitness(self, widget=None):
+        if os.path.exists("/sys/firmware/efi"):
+            out = subprocess.check_output(["cat", "/sys/firmware/efi/fw_platform_size"], text=True)
+            if "32" in out:
+                return 32
+            elif "64" in out:
+                return 64
+        return None
+    
+    def setup_drive(self):
+        drive = self.target_drive
+        # normalize to /dev/sdX
+        if not drive.startswith("/dev/"):
+            drive = f"/dev/{drive}"
+
+        uefi = (self.uefi_bitness() == 64)
+
+        if not debug:
+            os.system(f"sgdisk -Z {drive}") # wipe disk
+            os.system(f"sgdisk -o {drive}") # create new GPT/MBR depending on UEFI
+
+            if uefi:
+                # EFI partition
+                os.system(f"sgdisk -n 1:0:+512M -t 1:ef00 -c 1:'EFI System Partition' {drive}")
+                # Root partition
+                os.system(f"sgdisk -n 2:0:0 -t 2:8300 -c 2:'Linux Root' {drive}")
+
+                self.efi_part = f"{drive}1"
+                self.root_part = f"{drive}2"
+
+            else:
+                # BIOS root-only layout
+                os.system(f"sgdisk -n 1:0:0 -t 1:8300 -c 1:'Linux Root' {drive}")
+
+                self.efi_part = None
+                self.root_part = f"{drive}1"
+
+            os.system(f"mkfs.ext4 {self.root_part}")
+            if uefi:
+                os.system(f"mkfs.fat -F32 {self.efi_part}")
+
+        else:
+            print("DEBUG: Partitioning + formatting skipped")
+            print(f"DEBUG: target drive = {drive}")
+
+            if uefi:
+                print("DEBUG: Would create EFI + ROOT, format EFI as FAT32, ROOT as ext4")
+                self.efi_part = f"{drive}1"
+                self.root_part = f"{drive}2"
+            else:
+                print("DEBUG: Would create ROOT only, format ext4")
+                self.efi_part = None
+                self.root_part = f"{drive}1"
+
+    def install_base_system(self, widget):
+        if debug:
+            print(f"DEBUG: Would mount {self.root_part} to /mnt")
+            if self.efi_part:
+                print(f"DEBUG: Would mount {self.efi_part} to /mnt/boot")
+            print(f"DEBUG: Would run pacstrap /mnt base linux linux-firmware vim networkmanager")
+            print("DEBUG: Would generate fstab with genfstab")
+            return
+
+        # Mount root partition
+        os.system(f"mount {self.root_part} /mnt")
+
+        # Mount EFI if UEFI
+        if getattr(self, "efi_part", None):
+            os.makedirs("/mnt/boot", exist_ok=True)
+            os.system(f"mount {self.efi_part} /mnt/boot")
+
+        # Install base packages
+        base_packages = "base linux linux-firmware vim networkmanager"
+        os.system(f"pacstrap /mnt {base_packages}")
+
+        # Generate fstab
+        os.system("genfstab -U /mnt >> /mnt/etc/fstab")
+
     
     def get_drives(self):
         out = subprocess.check_output(["lsblk", "-dn", "-o", "NAME,SIZE,TYPE"], text=True)
